@@ -4,6 +4,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   SecretProviderId,
+  ServerSettingsError,
   ThreadId,
   type OrchestrationV2ProviderThread,
 } from "@t3tools/contracts";
@@ -23,7 +24,14 @@ const scenarios: ReadonlyArray<{
   fallback?: boolean;
   invalidRef?: boolean;
   noIdentity?: boolean;
-  key?: "global" | "legacy" | "instance" | "secret" | "missing";
+  key?:
+    | "global"
+    | "legacy"
+    | "instance"
+    | "secret"
+    | "secret_missing"
+    | "missing"
+    | "settings_failure";
   status?: number;
   failsAt?: "get" | "delete";
   reason?: BoxThreadCleanup.BoxThreadCleanupError["reason"];
@@ -37,7 +45,9 @@ const scenarios: ReadonlyArray<{
   { driver: "upstashBox", key: "legacy" },
   { driver: "boxCodex", key: "instance" },
   { driver: "upstashBox", key: "secret" },
+  { driver: "upstashBox", key: "secret_missing", reason: "credentials_unavailable" },
   { driver: "upstashBox", key: "missing", reason: "credentials_unavailable" },
+  { driver: "upstashBox", key: "settings_failure", reason: "credentials_unavailable" },
   { driver: "upstashBox", invalidRef: true, reason: "invalid_reference" },
   { driver: "upstashBox", fallback: true, noIdentity: true, reason: "invalid_reference" },
   { driver: "upstashBox", status: 404, failsAt: "get" },
@@ -103,29 +113,40 @@ it.effect.each(scenarios)(
       },
     };
     const key = scenario.key;
-    const settings = ServerSettings.ServerSettingsService.layerTest({
-      upstashBox: {
-        apiKey:
-          key === "global"
-            ? "private-key"
-            : key === "secret"
-              ? { provider: SecretProviderId.make("test"), reference: "box-key" }
-              : "",
-      },
-      providerInstances:
-        key === "legacy" || key === "instance"
-          ? {
-              [instanceId]: {
-                driver,
-                config: { apiKey: "private-key" },
-                environment:
-                  key === "instance"
-                    ? [{ name: "UPSTASH_BOX_API_KEY", value: "private-key", sensitive: true }]
-                    : [],
-              },
-            }
-          : {},
-    });
+    const settings =
+      key === "settings_failure"
+        ? Layer.mock(ServerSettings.ServerSettingsService)({
+            getSettings: Effect.fail(
+              new ServerSettingsError({
+                settingsPath: "test-settings.json",
+                operation: "read-file",
+                cause: upstreamError,
+              }),
+            ),
+          })
+        : ServerSettings.ServerSettingsService.layerTest({
+            upstashBox: {
+              apiKey:
+                key === "global"
+                  ? "private-key"
+                  : key === "secret" || key === "secret_missing"
+                    ? { provider: SecretProviderId.make("test"), reference: "box-key" }
+                    : "",
+            },
+            providerInstances:
+              key === "legacy" || key === "instance"
+                ? {
+                    [instanceId]: {
+                      driver,
+                      config: { apiKey: "private-key" },
+                      environment:
+                        key === "instance"
+                          ? [{ name: "UPSTASH_BOX_API_KEY", value: "private-key", sensitive: true }]
+                          : [],
+                    },
+                  }
+                : {},
+          });
     return Effect.gen(function* () {
       using _missingBox = vi
         .spyOn(BoxApi, "isMissingBox")
@@ -138,20 +159,37 @@ it.effect.each(scenarios)(
         assert.equal(result._tag, "Failure");
         if (result._tag === "Failure") {
           assert.equal(result.failure.reason, scenario.reason);
+          assert.equal(result.failure.providerThreadId, thread.id);
+          assert.equal(
+            result.failure.message,
+            `Could not delete the thread Box (${scenario.reason}).${scenario.reason === "delete_failed" ? " Box deletion refused for [REDACTED]" : ""}`,
+          );
           assert.notInclude(JSON.stringify(result.failure), "private upstream details");
           assert.notInclude(JSON.stringify(result.failure), "private-key");
+          assert.notInclude(JSON.stringify(result.failure), "Authorization");
           if (scenario.reason === "delete_failed") {
-            assert.deepEqual(result.failure.boxError, {
+            const diagnostic = {
               message: "Box deletion refused for [REDACTED]",
               statusCode: scenario.status,
               boxId: "persisted-box",
+            };
+            assert.deepEqual(result.failure.boxError, diagnostic);
+            assert.isUndefined(result.failure.cause);
+          } else if (key === "settings_failure") {
+            assert.deepEqual(result.failure.cause, {
+              message: "Server settings read-file failed at test-settings.json.",
             });
+          } else {
+            assert.isUndefined(result.failure.cause);
           }
         }
       } else assert.equal(result._tag, "Success");
       assert.deepEqual(
         calls,
-        scenario.reason === "invalid_reference" || key === "missing"
+        scenario.reason === "invalid_reference" ||
+          key === "missing" ||
+          key === "secret_missing" ||
+          key === "settings_failure"
           ? []
           : scenario.failsAt === "get"
             ? ["get"]
@@ -164,7 +202,7 @@ it.effect.each(scenarios)(
             Layer.mergeAll(
               settings,
               Layer.mock(SecretResolver.SecretResolver)({
-                read: () => Effect.succeed(["private-key"]),
+                read: () => Effect.succeed(key === "secret_missing" ? [] : ["private-key"]),
               }),
               Layer.succeed(BoxApi.BoxApi, {
                 get: async (id, apiKey) => {

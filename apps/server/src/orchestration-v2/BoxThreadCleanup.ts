@@ -22,6 +22,7 @@ export class BoxThreadCleanupError extends Schema.TaggedError<BoxThreadCleanupEr
     threadId: ThreadId,
     providerThreadId: Schema.optional(ProviderThreadId),
     boxError: Schema.optional(BoxApi.BoxErrorDetails),
+    cause: Schema.optional(BoxApi.BoxErrorDetails),
     reason: Schema.Literals([
       "load_failed",
       "invalid_reference",
@@ -34,6 +35,8 @@ export class BoxThreadCleanupError extends Schema.TaggedError<BoxThreadCleanupEr
     return `Could not delete the thread Box (${this.reason}).${this.boxError ? ` ${this.boxError.message}` : ""}`;
   }
 }
+
+const isBoxThreadCleanupError = Schema.is(BoxThreadCleanupError);
 
 export class BoxThreadCleanup extends Context.Service<
   BoxThreadCleanup,
@@ -81,7 +84,17 @@ const make = Effect.gen(function* () {
         (thread.appThreadId ? `t3-${Buffer.from(thread.appThreadId).toString("hex")}` : undefined);
       if (!nativeId) return yield* failure("invalid_reference");
       const apiKey = yield* Effect.gen(function* () {
-        const current = yield* settings.getSettings;
+        const current = yield* settings.getSettings.pipe(
+          Effect.mapError(
+            (cause) =>
+              new BoxThreadCleanupError({
+                threadId,
+                providerThreadId: thread.id,
+                reason: "credentials_unavailable",
+                cause: BoxApi.boxErrorDetails(cause),
+              }),
+          ),
+        );
         const instance = deriveProviderInstanceConfigMap(current)[thread.providerInstanceId];
         const configured = instance?.driver === thread.driver ? instance : undefined;
         const globalKey = yield* readSecret(current.upstashBox.apiKey, threadId);
@@ -97,7 +110,13 @@ const make = Effect.gen(function* () {
         return environmentValue === undefined
           ? yield* Config.String("UPSTASH_BOX_API_KEY").pipe(Config.withDefault(""))
           : yield* readSecret(environmentValue, threadId);
-      }).pipe(Effect.mapError(() => failure("credentials_unavailable")));
+      }).pipe(
+        Effect.mapError((cause) =>
+          isBoxThreadCleanupError(cause) && cause.cause
+            ? cause
+            : failure("credentials_unavailable"),
+        ),
+      );
       if (!apiKey) return yield* failure("credentials_unavailable");
       yield* Effect.tryPromise({
         try: async () => {
@@ -108,13 +127,15 @@ const make = Effect.gen(function* () {
             if (!BoxApi.isMissingBox(error)) throw error;
           }
         },
-        catch: (error) =>
-          new BoxThreadCleanupError({
+        catch: (error) => {
+          const diagnostic = BoxApi.boxErrorDetails(error, { apiKeys: [apiKey], boxId: nativeId });
+          return new BoxThreadCleanupError({
             threadId,
             providerThreadId: thread.id,
             reason: "delete_failed",
-            boxError: BoxApi.boxErrorDetails(error, { apiKeys: [apiKey], boxId: nativeId }),
-          }),
+            boxError: diagnostic,
+          });
+        },
       });
     }),
   });

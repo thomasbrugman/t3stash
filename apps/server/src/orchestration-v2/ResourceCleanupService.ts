@@ -1,4 +1,5 @@
 import { isUpstashBoxDriver } from "@t3tools/provider-upstash-box/harnesses";
+import { BoxApi } from "@t3tools/provider-upstash-box/server";
 import {
   ThreadId,
   type OrchestrationV2ProviderThread,
@@ -59,13 +60,16 @@ export const layerBoxCleanup = Layer.effect(
     const cleanup = Effect.fn("ResourceCleanupService.cleanupBoxes")(function* (
       threadId: ThreadId,
     ) {
-      const records = yield* projections
-        .getThreadRecords(threadId, ["providerThreads"])
-        .pipe(
-          Effect.mapError(
-            () => new BoxThreadCleanup.BoxThreadCleanupError({ threadId, reason: "load_failed" }),
-          ),
-        );
+      const records = yield* projections.getThreadRecords(threadId, ["providerThreads"]).pipe(
+        Effect.mapError(
+          (cause) =>
+            new BoxThreadCleanup.BoxThreadCleanupError({
+              threadId,
+              reason: "load_failed",
+              cause: BoxApi.boxErrorDetails(cause),
+            }),
+        ),
+      );
       yield* cleanupBoxThreads({
         threadId,
         deleted: records.thread.deletedAt !== null,
